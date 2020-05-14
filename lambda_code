@@ -1,0 +1,176 @@
+import os
+import boto3
+import logging
+import json
+from botocore.exceptions import ClientError
+from botocore.vendored import requests  #library for getting the web page
+import re  #regular expression library for parsing text
+import csv
+from datetime import date, timedelta
+
+
+
+def get_webpage(webpage_url):
+    # Reutns html for the page provided. Input: website url. Output: raw html
+    page = requests.get(webpage_url)
+    return(page)
+
+
+def lambda_handler(event, context):
+
+    try:
+    
+        # go out and get the website pages for historical data for UDOW S&P500 and NASDAQ
+
+        webpage_url = "https://finance.yahoo.com/quote/UDOW/history?p=UDOW"  # UDOW
+        webpage_url2 = "https://finance.yahoo.com/quote/%5EGSPC/history?p=%5EGSPC"  # S&P500
+        webpage_url3 = "https://finance.yahoo.com/quote/%5EIXIC/history?p=%5EIXIC"  # NASDAQ
+
+        web_page = get_webpage(webpage_url)
+        web_page2 = get_webpage(webpage_url2)
+        web_page3 = get_webpage(webpage_url3)
+
+        print("UDOW", web_page)
+        print("S&P500", web_page2)
+        print("NASDAQ", web_page3)
+
+        # set date parameters for the regular expression filter
+        today = date.today()
+        d1 = today.strftime("%B %d, %Y")
+        weekday = today.weekday()
+
+        # in order to get stock data from the table for today and yesterday, 
+        # the re parses to the date two days ago. If today is a Monday or Tuesday, 
+        # use Thursday or Friday as the boundary
+        if weekday == 0:
+            delta = timedelta(days=4)
+        elif weekday == 1:
+            delta = timedelta(days=4)
+        else:
+            delta = timedelta(days=2)
+    
+        yesterday = today - delta
+        d2 = yesterday.strftime("%B %d, %Y")
+        
+        # use re to extract section that has the price data
+        udow_price = re.search(rf"{d1}(.+?){d2}", web_page.text)
+        udowstring=udow_price.group(1)
+
+        sp500_price = re.search(rf"{d1}(.+?){d2}", web_page2.text)
+        sp500string=sp500_price.group(1)
+
+        nasdaq_price = re.search(rf"{d1}(.+?){d2}", web_page3.text)
+        nasdaqstring=nasdaq_price.group(1)
+
+        #extract the raw prices as tuples
+        udow_price2 = re.findall("((?P<o>>)[0-9]{1,3}[\.][0-9]{2})+", udowstring)
+        sp500_price2 = re.findall("(([0-9]{0,3}[\,])*[0-9]{3}[\.][0-9]{2})", sp500string)
+        nasdaq_price2 = re.findall("(([0-9]{0,3}[\,])*[0-9]{3}[\.][0-9]{2})", nasdaqstring)
+
+        #extract the raw volumes
+        udow_volumes = re.findall("((([0-9]{0,3}[\,])*[0-9]{3}[\,][0-9]{3}))+", udowstring)
+        sp500_volumes = re.findall("((([0-9]{0,3}[\,])*[0-9]{3}[\,][0-9]{3}))+", sp500string)
+        nasdaq_volumes = re.findall("((([0-9]{0,3}[\,])*[0-9]{3}[\,][0-9]{3}))+", nasdaqstring)
+
+        #convert to a list
+        udow_price3=[]
+        for item in udow_price2:
+            udow_price3.append(item[0])
+    
+        sp500_price3=[]
+        for item in sp500_price2:
+            sp500_price3.append(item[0])
+
+        nasdaq_price3=[]
+        for item in nasdaq_price2:
+            nasdaq_price3.append(item[0])
+    
+        udow_vol2=[]
+        for item in udow_volumes:
+            udow_vol2.append(item[0])
+
+        sp500_vol2=[]
+        for item in sp500_volumes:
+            sp500_vol2.append(item[0])
+    
+        nasdaq_vol2=[]
+        for item in nasdaq_volumes:
+            nasdaq_vol2.append(item[0])
+    
+        #drop extra characters
+        udow_price4=[]
+        for item in udow_price3:
+            udow_price4.append(item[1:])
+
+        #convert prices from string to float
+        x=0
+        for item in udow_price4:
+            udow_price4[x] = float(item)
+            x+=1
+
+        x=0
+        for item in sp500_price3:
+            sp500_price3[x] = float(item.replace(',', ''))
+            x+=1
+    
+        x=0
+        for item in nasdaq_price3:
+            nasdaq_price3[x] = float(item.replace(',', ''))
+            x+=1
+
+        x=0
+        for item in udow_vol2:
+            udow_vol2[x] = int(item.replace(',', ''))
+            x+=1  
+    
+        x=0
+        for item in sp500_vol2:
+            sp500_vol2[x] = int(item.replace(',', ''))
+            x+=1  
+    
+        x=0
+        for item in nasdaq_vol2:
+            nasdaq_vol2[x] = int(item.replace(',', ''))
+            x+=1  
+
+        #drop the duplicate values and consolidate with volume  
+        udow_price4= (udow_price4[0:4] + udow_price4[5:9] + udow_vol2)  
+        sp500_price3= sp500_price3[0:4] + sp500_price3[5:9] + sp500_vol2
+        nasdaq_price3= nasdaq_price3[0:4] + nasdaq_price3[5:9] + nasdaq_vol2
+        todaydate = []
+        todaydate.append(d1)
+        final_list = todaydate + udow_price4 + sp500_price3 + nasdaq_price3
+  
+        # convert final list into a csv in prep for upload to s3
+        with open('/tmp/csv_file.csv', 'w+', newline='') as temp_csv_file:
+            writer = csv.writer(temp_csv_file)
+            writer.writerow(final_list)
+
+        #set up s3 variables
+        bucket = 'chris-stocks-udow'
+        path= today.strftime("%Y/%m/%d")
+        s3_client = boto3.client('s3')
+
+        response = s3_client.upload_file("/tmp/csv_file.csv", bucket, path)
+        print("s3 upload is complete", response)
+
+        message = ("UDOW Crawler has completed")
+        client = boto3.client('sns')
+        response = client.publish(
+            TargetArn="arn:aws:sns:us-east-1:474619262072:UDOW-stock-data",
+            MessageAttributes= {
+                'AWS.SNS.SMS.SMSType': {
+                    'DataType': 'String', 
+                    'StringValue': 'Transactional'}},
+            Message=json.dumps(message))
+
+    except:
+        message = ("UDOW Crawler has failed. Check the logs.")
+        client = boto3.client('sns')
+        response = client.publish(
+            TargetArn="arn:aws:sns:us-east-1:474619262072:UDOW-stock-data",
+            MessageAttributes= {
+                'AWS.SNS.SMS.SMSType': {
+                    'DataType': 'String', 
+                    'StringValue': 'Transactional'}},
+            Message=json.dumps(message))
